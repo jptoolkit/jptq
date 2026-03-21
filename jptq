@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# jptq - Bash Task Queue Runner
+# Manages a queue of shell tasks with persistence in SQLite.
+
+SQLITE3="${JPTQ_SQLITE3:-sqlite3}"
+
+# ──────────────────────────────────────────────
+# SQL helpers
+# ──────────────────────────────────────────────
+
+sql_escape() {
+    # Escape single quotes for SQL string literals: ' → ''
+    local val="$1"
+    printf '%s' "${val//\'/\'\'}"
+}
+
+db_exec() {
+    # Execute SQL that modifies data (no output expected)
+    local db="$1" sql="$2"
+    "$SQLITE3" "$db" "$sql" 2>&1
+}
+
+db_query() {
+    # Execute SQL that returns data, pipe-separated by default
+    local db="$1" sql="$2" sep="${3:-|}"
+    "$SQLITE3" -separator "$sep" "$db" "$sql" 2>&1
+}
+
+# ──────────────────────────────────────────────
+# Backoff computation
+# ──────────────────────────────────────────────
+
+compute_backoff() {
+    # Returns backoff delay in minutes for a given retry count (1-based)
+    local retry="$1"
+    case "$retry" in
+        1) echo 5 ;;
+        2) echo 10 ;;
+        *) echo 15 ;;
+    esac
+}
+
+# ──────────────────────────────────────────────
+# Commands
+# ──────────────────────────────────────────────
+
+cmd_init() {
+    local db="$1"
+    db_exec "$db" "PRAGMA journal_mode=WAL;" > /dev/null
+    db_exec "$db" "
+        CREATE TABLE IF NOT EXISTS tasks (
+            id           TEXT PRIMARY KEY,
+            state        TEXT NOT NULL DEFAULT 'queued'
+                         CHECK(state IN ('queued','running','completed','failed','paused')),
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
+            scheduled_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now')),
+            started_at   TEXT,
+            retry_count  INTEGER NOT NULL DEFAULT 0,
+            interval     INTEGER,
+            command      TEXT NOT NULL,
+            worker_pid   INTEGER
+        );
+    "
+    echo "Initialized database: $db"
+}
+
+cmd_task() {
+    local db="$1"
+    shift
+
+    # Parse --at flag
+    local scheduled_at=""
+    if [[ "${1:-}" == "--at" ]]; then
+        scheduled_at="$2"
+        shift 2
+    fi
+
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: jptq task <queue_file> [--at \"YYYY-MM-DD HH:MM:SS\"] <task_id> <command...>" >&2
+        return 1
+    fi
+
+    local task_id="$1"
+    shift
+    local command="$*"
+
+    local esc_id esc_cmd
+    esc_id="$(sql_escape "$task_id")"
+    esc_cmd="$(sql_escape "$command")"
+
+    local sched_clause
+    if [[ -n "$scheduled_at" ]]; then
+        local esc_sched
+        esc_sched="$(sql_escape "$scheduled_at")"
+        sched_clause="'${esc_sched}'"
+    else
+        sched_clause="strftime('%Y-%m-%d %H:%M:%S','now')"
+    fi
+
+    local result
+    result=$(db_exec "$db" "
+        INSERT INTO tasks (id, command, scheduled_at)
+        VALUES ('${esc_id}', '${esc_cmd}', ${sched_clause});
+    " 2>&1) || true
+
+    if [[ "$result" == *"UNIQUE constraint"* ]]; then
+        echo "Error: Task '${task_id}' already exists." >&2
+        return 1
+    elif [[ "$result" == *"Error"* ]]; then
+        echo "$result" >&2
+        return 1
+    fi
+
+    echo "Added task: ${task_id}"
+}
+
+cmd_interval() {
+    local db="$1"
+    shift
+
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: jptq interval <queue_file> <interval_minutes> <task_id> <command...>" >&2
+        return 1
+    fi
+
+    local interval_min="$1"
+    local task_id="$2"
+    shift 2
+    local command="$*"
+
+    if ! [[ "$interval_min" =~ ^[0-9]+$ ]] || [[ "$interval_min" -eq 0 ]]; then
+        echo "Error: Interval must be a positive integer (minutes)." >&2
+        return 1
+    fi
+
+    local esc_id esc_cmd
+    esc_id="$(sql_escape "$task_id")"
+    esc_cmd="$(sql_escape "$command")"
+
+    local result
+    result=$(db_exec "$db" "
+        INSERT INTO tasks (id, command, interval)
+        VALUES ('${esc_id}', '${esc_cmd}', ${interval_min});
+    " 2>&1) || true
+
+    if [[ "$result" == *"UNIQUE constraint"* ]]; then
+        echo "Error: Task '${task_id}' already exists." >&2
+        return 1
+    elif [[ "$result" == *"Error"* ]]; then
+        echo "$result" >&2
+        return 1
+    fi
+
+    echo "Added recurring task: ${task_id} (every ${interval_min} min)"
+}
+
+cmd_delete() {
+    local db="$1" task_id="$2"
+    local esc_id
+    esc_id="$(sql_escape "$task_id")"
+
+    local changes
+    changes=$(db_query "$db" "DELETE FROM tasks WHERE id = '${esc_id}'; SELECT changes();")
+
+    if [[ "$changes" -eq 0 ]]; then
+        echo "Error: Task '${task_id}' not found." >&2
+        return 1
+    fi
+    echo "Deleted task: ${task_id}"
+}
+
+cmd_pause() {
+    local db="$1" task_id="$2"
+    local esc_id
+    esc_id="$(sql_escape "$task_id")"
+
+    local changes
+    changes=$(db_query "$db" "
+        UPDATE tasks SET state = 'paused'
+        WHERE id = '${esc_id}' AND state IN ('queued', 'failed');
+        SELECT changes();
+    ")
+
+    if [[ "$changes" -eq 0 ]]; then
+        echo "Error: Task '${task_id}' not found or not in queued/failed state." >&2
+        return 1
+    fi
+    echo "Paused task: ${task_id}"
+}
+
+cmd_restore() {
+    local db="$1" task_id="$2"
+    local esc_id
+    esc_id="$(sql_escape "$task_id")"
+
+    local changes
+    changes=$(db_query "$db" "
+        UPDATE tasks SET state = 'queued', retry_count = 0,
+                         scheduled_at = strftime('%Y-%m-%d %H:%M:%S','now')
+        WHERE id = '${esc_id}' AND state = 'paused';
+        SELECT changes();
+    ")
+
+    if [[ "$changes" -eq 0 ]]; then
+        echo "Error: Task '${task_id}' not found or not paused." >&2
+        return 1
+    fi
+    echo "Restored task: ${task_id}"
+}
+
+cmd_list() {
+    local db="$1"
+    local header="ID|STATE|RETRY|INTERVAL|SCHEDULED_AT|COMMAND"
+    local rows
+    rows=$(db_query "$db" "
+        SELECT id, state, retry_count, COALESCE(interval,'-'), scheduled_at, command
+        FROM tasks ORDER BY scheduled_at;
+    ")
+
+    if [[ -z "$rows" ]]; then
+        echo "No tasks found."
+        return 0
+    fi
+
+    # Two-pass: compute column widths, then format
+    local all_lines
+    all_lines=$(printf '%s\n%s' "$header" "$rows")
+    local -a widths=()
+    while IFS='|' read -ra fields; do
+        for i in "${!fields[@]}"; do
+            local len=${#fields[$i]}
+            if [[ -z "${widths[$i]+x}" ]] || (( len > widths[i] )); then
+                widths[$i]=$len
+            fi
+        done
+    done <<< "$all_lines"
+
+    while IFS='|' read -ra fields; do
+        local line=""
+        for i in "${!fields[@]}"; do
+            if [[ -n "$line" ]]; then
+                line+="  "
+            fi
+            printf -v padded "%-${widths[$i]}s" "${fields[$i]}"
+            line+="$padded"
+        done
+        echo "$line"
+    done <<< "$all_lines"
+}
+
+# ──────────────────────────────────────────────
+# Consumer
+# ──────────────────────────────────────────────
+
+recover_stale() {
+    local db="$1"
+    local stale_tasks
+    stale_tasks=$(db_query "$db" "
+        SELECT id, worker_pid FROM tasks WHERE state = 'running';
+    ")
+
+    if [[ -z "$stale_tasks" ]]; then
+        return 0
+    fi
+
+    while IFS='|' read -r tid wpid; do
+        if [[ -z "$tid" ]]; then
+            continue
+        fi
+        # Check if worker PID is still alive
+        if [[ -z "$wpid" ]] || ! kill -0 "$wpid" 2>/dev/null; then
+            local esc_tid
+            esc_tid="$(sql_escape "$tid")"
+            db_exec "$db" "
+                UPDATE tasks SET state = 'queued', worker_pid = NULL, started_at = NULL
+                WHERE id = '${esc_tid}' AND state = 'running';
+            "
+            echo "[recover] Reset stale task: ${tid}"
+        fi
+    done <<< "$stale_tasks"
+}
+
+claim_task() {
+    local db="$1" my_pid="$2"
+    # Atomically claim one eligible task
+    local task_info
+    task_info=$(db_query "$db" "
+        BEGIN IMMEDIATE;
+        UPDATE tasks
+        SET state = 'running',
+            worker_pid = ${my_pid},
+            started_at = strftime('%Y-%m-%d %H:%M:%S','now')
+        WHERE id = (
+            SELECT id FROM tasks
+            WHERE state = 'queued'
+              AND scheduled_at <= strftime('%Y-%m-%d %H:%M:%S','now')
+            ORDER BY scheduled_at
+            LIMIT 1
+        );
+        SELECT id, command, interval, retry_count FROM tasks
+        WHERE state = 'running' AND worker_pid = ${my_pid};
+        COMMIT;
+    ")
+
+    echo "$task_info"
+}
+
+run_task() {
+    local db="$1" task_id="$2" command="$3" interval="$4" retry_count="$5"
+    local esc_id
+    esc_id="$(sql_escape "$task_id")"
+
+    echo "[run] Executing task: ${task_id} (command: ${command})"
+
+    local exit_code=0
+    bash -c "$command" || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        if [[ -z "$interval" || "$interval" == "-" ]]; then
+            # One-time task, mark completed
+            db_exec "$db" "
+                UPDATE tasks SET state = 'completed', worker_pid = NULL
+                WHERE id = '${esc_id}';
+            "
+            echo "[run] Task ${task_id}: completed"
+        else
+            # Recurring task, reschedule
+            db_exec "$db" "
+                UPDATE tasks
+                SET state = 'queued',
+                    worker_pid = NULL,
+                    started_at = NULL,
+                    retry_count = 0,
+                    scheduled_at = strftime('%Y-%m-%d %H:%M:%S', 'now', '+${interval} minutes')
+                WHERE id = '${esc_id}';
+            "
+            echo "[run] Task ${task_id}: rescheduled (next in ${interval} min)"
+        fi
+    else
+        local new_retry=$((retry_count + 1))
+        if [[ $new_retry -ge 10 ]]; then
+            db_exec "$db" "
+                UPDATE tasks SET state = 'failed', worker_pid = NULL, retry_count = ${new_retry}
+                WHERE id = '${esc_id}';
+            "
+            echo "[run] Task ${task_id}: failed (max retries reached)"
+        else
+            local backoff
+            backoff=$(compute_backoff "$new_retry")
+            db_exec "$db" "
+                UPDATE tasks
+                SET state = 'queued',
+                    worker_pid = NULL,
+                    started_at = NULL,
+                    retry_count = ${new_retry},
+                    scheduled_at = strftime('%Y-%m-%d %H:%M:%S', 'now', '+${backoff} minutes')
+                WHERE id = '${esc_id}';
+            "
+            echo "[run] Task ${task_id}: retry ${new_retry}/10 (backoff ${backoff} min)"
+        fi
+    fi
+}
+
+cmd_consume() {
+    local db="$1"
+    local sleep_minutes="${2:-1}"
+
+    # Validate sleep_minutes is a number
+    if ! [[ "$sleep_minutes" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+        echo "Error: Sleep interval must be a number (minutes)." >&2
+        return 1
+    fi
+
+    local my_pid=$$
+    local running=true
+
+    # Signal handling: finish current task, then exit
+    trap 'echo "[consume] Received signal, will exit after current task..."; running=false' SIGTERM SIGINT
+
+    echo "[consume] Starting consumer (PID: ${my_pid}, poll: ${sleep_minutes} min)"
+
+    while $running; do
+        # Recover stale tasks from dead workers
+        recover_stale "$db"
+
+        # Try to claim a task
+        local task_info
+        task_info=$(claim_task "$db" "$my_pid")
+
+        if [[ -n "$task_info" ]]; then
+            # Parse the task info (may have multiple lines from BEGIN/COMMIT, take last non-empty)
+            local task_line=""
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && task_line="$line"
+            done <<< "$task_info"
+
+            if [[ -n "$task_line" ]]; then
+                local tid tcmd tinterval tretry
+                IFS='|' read -r tid tcmd tinterval tretry <<< "$task_line"
+
+                if [[ -n "$tid" ]]; then
+                    run_task "$db" "$tid" "$tcmd" "$tinterval" "$tretry"
+                    continue  # Check for more tasks immediately
+                fi
+            fi
+        fi
+
+        # No tasks available, sleep
+        if $running; then
+            local sleep_secs
+            sleep_secs=$(awk "BEGIN {printf \"%.1f\", ${sleep_minutes} * 60}")
+            sleep "$sleep_secs" &
+            wait $! 2>/dev/null || true  # Allow signal to interrupt sleep
+        fi
+    done
+
+    echo "[consume] Consumer stopped."
+}
+
+# ──────────────────────────────────────────────
+# Main / dispatch
+# ──────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+jptq - Bash Task Queue Runner
+
+Usage:
+  jptq init <queue_file>
+  jptq task <queue_file> [--at "YYYY-MM-DD HH:MM:SS"] <task_id> <command...>
+  jptq interval <queue_file> <interval_minutes> <task_id> <command...>
+  jptq delete <queue_file> <task_id>
+  jptq pause <queue_file> <task_id>
+  jptq restore <queue_file> <task_id>
+  jptq list <queue_file>
+  jptq consume <queue_file> [poll_interval_minutes]
+
+Commands:
+  init      Initialize a new task queue database
+  task      Add a one-time task (optionally scheduled with --at)
+  interval  Add a recurring task with interval in minutes
+  delete    Remove a task from the queue
+  pause     Pause a queued or failed task
+  restore   Restore a paused task (resets retry count)
+  list      List all tasks in the queue
+  consume   Start processing tasks (poll interval default: 1 min)
+EOF
+}
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 1
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        init)
+            [[ $# -lt 1 ]] && { echo "Usage: jptq init <queue_file>" >&2; exit 1; }
+            cmd_init "$1"
+            ;;
+        task)
+            [[ $# -lt 3 ]] && { echo "Usage: jptq task <queue_file> [--at ...] <task_id> <command...>" >&2; exit 1; }
+            local db="$1"; shift
+            cmd_task "$db" "$@"
+            ;;
+        interval)
+            [[ $# -lt 4 ]] && { echo "Usage: jptq interval <queue_file> <interval_min> <task_id> <command...>" >&2; exit 1; }
+            local db="$1"; shift
+            cmd_interval "$db" "$@"
+            ;;
+        delete)
+            [[ $# -lt 2 ]] && { echo "Usage: jptq delete <queue_file> <task_id>" >&2; exit 1; }
+            cmd_delete "$1" "$2"
+            ;;
+        pause)
+            [[ $# -lt 2 ]] && { echo "Usage: jptq pause <queue_file> <task_id>" >&2; exit 1; }
+            cmd_pause "$1" "$2"
+            ;;
+        restore)
+            [[ $# -lt 2 ]] && { echo "Usage: jptq restore <queue_file> <task_id>" >&2; exit 1; }
+            cmd_restore "$1" "$2"
+            ;;
+        list)
+            [[ $# -lt 1 ]] && { echo "Usage: jptq list <queue_file>" >&2; exit 1; }
+            cmd_list "$1"
+            ;;
+        consume)
+            [[ $# -lt 1 ]] && { echo "Usage: jptq consume <queue_file> [poll_interval]" >&2; exit 1; }
+            cmd_consume "$1" "${2:-1}"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+# Only run main when executed directly, not when sourced
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
