@@ -1,5 +1,7 @@
 # jptq — Bash Task Queue Runner
 
+[![Build Status](https://github.com/jptoolkit/jptq/workflows/Build/badge.svg)](https://github.com/jptoolkit/jptq/actions)
+
 A lightweight, persistent task queue for the Linux command line. `jptq` manages shell tasks using a SQLite database, supporting one-time and recurring execution, automatic retries with backoff, scheduled runs, and graceful recovery from crashes.
 
 ## Features
@@ -22,7 +24,7 @@ A lightweight, persistent task queue for the Linux command line. `jptq` manages 
 ## Installation
 
 ```bash
-git clone <repository-url> jptq
+git clone git@github.com:jptoolkit/jptq.git jptq
 cd jptq
 chmod +x jptq
 ```
