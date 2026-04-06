@@ -106,14 +106,35 @@ cmd_task() {
     " 2>&1) || true
 
     if [[ "$result" == *"UNIQUE constraint"* ]]; then
-        echo "Error: Task '${task_id}' already exists." >&2
-        return 1
+        local existing_state
+        existing_state=$(db_query "$db" "SELECT state FROM tasks WHERE id = '${esc_id}';")
+        if [[ "$existing_state" == "completed" ]]; then
+            local upd_result
+            upd_result=$(db_exec "$db" "
+                UPDATE tasks
+                SET state = 'queued',
+                    command = '${esc_cmd}',
+                    scheduled_at = ${sched_clause},
+                    retry_count = 0,
+                    started_at = NULL,
+                    worker_pid = NULL
+                WHERE id = '${esc_id}' AND state = 'completed';
+            " 2>&1)
+            if [[ -n "$upd_result" ]]; then
+                echo "$upd_result" >&2
+                return 1
+            fi
+            echo "Updated task: ${task_id}"
+        else
+            echo "Error: Task '${task_id}' already exists." >&2
+            return 1
+        fi
     elif [[ "$result" == *"Error"* ]]; then
         echo "$result" >&2
         return 1
+    else
+        echo "Added task: ${task_id}"
     fi
-
-    echo "Added task: ${task_id}"
 }
 
 cmd_interval() {
@@ -146,14 +167,36 @@ cmd_interval() {
     " 2>&1) || true
 
     if [[ "$result" == *"UNIQUE constraint"* ]]; then
-        echo "Error: Task '${task_id}' already exists." >&2
-        return 1
+        local existing_state
+        existing_state=$(db_query "$db" "SELECT state FROM tasks WHERE id = '${esc_id}';")
+        if [[ "$existing_state" == "completed" ]]; then
+            local upd_result
+            upd_result=$(db_exec "$db" "
+                UPDATE tasks
+                SET state = 'queued',
+                    command = '${esc_cmd}',
+                    interval = ${interval_min},
+                    scheduled_at = strftime('%Y-%m-%d %H:%M:%S','now'),
+                    retry_count = 0,
+                    started_at = NULL,
+                    worker_pid = NULL
+                WHERE id = '${esc_id}' AND state = 'completed';
+            " 2>&1)
+            if [[ -n "$upd_result" ]]; then
+                echo "$upd_result" >&2
+                return 1
+            fi
+            echo "Updated recurring task: ${task_id} (every ${interval_min} min)"
+        else
+            echo "Error: Task '${task_id}' already exists." >&2
+            return 1
+        fi
     elif [[ "$result" == *"Error"* ]]; then
         echo "$result" >&2
         return 1
+    else
+        echo "Added recurring task: ${task_id} (every ${interval_min} min)"
     fi
-
-    echo "Added recurring task: ${task_id} (every ${interval_min} min)"
 }
 
 cmd_delete() {

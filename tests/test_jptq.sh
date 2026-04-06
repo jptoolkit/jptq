@@ -388,6 +388,94 @@ test_stale_recovery() {
     assert_eq "stale task completed after recovery" "completed" "$state_after"
 }
 
+test_requeue_completed_task() {
+    echo "TEST: requeue completed one-time task"
+    local db
+    db=$(new_db)
+
+    "$JPTQ" task "$db" rq1 echo original > /dev/null
+    "$SQLITE3" "$db" "UPDATE tasks SET state = 'completed' WHERE id = 'rq1';"
+
+    local out
+    out=$("$JPTQ" task "$db" rq1 echo updated 2>&1)
+    assert_contains "update confirmation" "Updated task: rq1" "$out"
+
+    local state
+    state=$(db_state "$db" "rq1")
+    assert_eq "state reset to queued" "queued" "$state"
+
+    local cmd
+    cmd=$(db_field "$db" "command" "rq1")
+    assert_eq "command updated" "echo updated" "$cmd"
+
+    local retry
+    retry=$(db_field "$db" "retry_count" "rq1")
+    assert_eq "retry_count reset to 0" "0" "$retry"
+}
+
+test_requeue_completed_task_with_at() {
+    echo "TEST: requeue completed task with --at"
+    local db
+    db=$(new_db)
+
+    "$JPTQ" task "$db" rq2 echo original > /dev/null
+    "$SQLITE3" "$db" "UPDATE tasks SET state = 'completed' WHERE id = 'rq2';"
+
+    "$JPTQ" task "$db" --at "2099-06-01 12:00:00" rq2 echo future > /dev/null
+
+    local sched
+    sched=$(db_field "$db" "scheduled_at" "rq2")
+    assert_eq "scheduled_at updated" "2099-06-01 12:00:00" "$sched"
+
+    local cmd
+    cmd=$(db_field "$db" "command" "rq2")
+    assert_eq "command updated with --at" "echo future" "$cmd"
+}
+
+test_requeue_completed_recurring_task() {
+    echo "TEST: requeue completed recurring task"
+    local db
+    db=$(new_db)
+
+    "$JPTQ" interval "$db" 5 rqr1 echo original > /dev/null
+    "$SQLITE3" "$db" "UPDATE tasks SET state = 'completed' WHERE id = 'rqr1';"
+
+    local out
+    out=$("$JPTQ" interval "$db" 10 rqr1 echo updated 2>&1)
+    assert_contains "update recurring confirmation" "Updated recurring task: rqr1" "$out"
+
+    local state
+    state=$(db_state "$db" "rqr1")
+    assert_eq "recurring state reset to queued" "queued" "$state"
+
+    local cmd
+    cmd=$(db_field "$db" "command" "rqr1")
+    assert_eq "recurring command updated" "echo updated" "$cmd"
+
+    local interval
+    interval=$(db_field "$db" "interval" "rqr1")
+    assert_eq "interval updated to 10" "10" "$interval"
+
+    local retry
+    retry=$(db_field "$db" "retry_count" "rqr1")
+    assert_eq "recurring retry_count reset to 0" "0" "$retry"
+}
+
+test_duplicate_non_completed_still_errors() {
+    echo "TEST: duplicate task in non-completed state still errors"
+    local db
+    db=$(new_db)
+
+    "$JPTQ" task "$db" nodup echo first > /dev/null
+
+    for state in queued paused failed; do
+        "$SQLITE3" "$db" "UPDATE tasks SET state = '${state}' WHERE id = 'nodup';"
+        local out
+        out=$("$JPTQ" task "$db" nodup echo second 2>&1) || true
+        assert_contains "duplicate error in state=${state}" "already exists" "$out"
+    done
+}
+
 test_sql_injection_prevention() {
     echo "TEST: SQL injection prevention"
     local db
@@ -466,6 +554,10 @@ test_retry_and_backoff
 test_max_retries_fail
 test_pause_failed_task
 test_stale_recovery
+test_requeue_completed_task
+test_requeue_completed_task_with_at
+test_requeue_completed_recurring_task
+test_duplicate_non_completed_still_errors
 test_sql_injection_prevention
 test_backoff_values
 test_scheduled_at_future
